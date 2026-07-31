@@ -162,13 +162,19 @@ def _eos_ids() -> list[int]:
             ids.append(val)
         elif isinstance(val, list):
             ids.extend(v for v in val if isinstance(v, int))
-    # Gemma chat turns terminate on <end_of_turn>
-    try:
-        turn_end = TOKENIZER.convert_tokens_to_ids("<end_of_turn>")
-        if isinstance(turn_end, int) and turn_end >= 0:
+    # Gemma chat turns terminate on the turn-end marker, but its spelling differs
+    # by checkpoint: <end_of_turn> on some, <turn|> on the QAT E2B ones. A name
+    # absent from the vocab does not raise -- convert_tokens_to_ids returns
+    # unk_token_id, which is >= 0 and so passed the old guard. That put <unk> in
+    # the stop set while leaving the REAL terminator out of it.
+    unk = getattr(TOKENIZER, "unk_token_id", None)
+    for name in ("<end_of_turn>", "<turn|>"):
+        try:
+            turn_end = TOKENIZER.convert_tokens_to_ids(name)
+        except Exception:
+            continue
+        if isinstance(turn_end, int) and turn_end >= 0 and turn_end != unk:
             ids.append(turn_end)
-    except Exception:
-        pass
     return sorted(set(ids))
 
 
@@ -299,7 +305,13 @@ def list_models():
 def _chat_prompt_ids(messages) -> list[int]:
     formatted = [{"role": m.role, "content": m.content} for m in messages]
     if hasattr(TOKENIZER, "apply_chat_template"):
-        return TOKENIZER.apply_chat_template(formatted, tokenize=True, add_generation_prompt=True)
+        encoded = TOKENIZER.apply_chat_template(
+            formatted, tokenize=True, add_generation_prompt=True)
+        # Transformers 5 may return a BatchEncoding/dict here instead of the
+        # bare token list returned by earlier versions.
+        if hasattr(encoded, "keys") and "input_ids" in encoded:
+            encoded = encoded["input_ids"]
+        return list(encoded)
     text = "\n".join(f"{m.role}: {m.content}" for m in messages)
     return TOKENIZER(text)["input_ids"]
 
