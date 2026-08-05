@@ -32,10 +32,13 @@ logger = logging.getLogger(__name__)
 # Pallas has no TPU backend on a CPU host; interpret mode lets the fused W4A16
 # kernel run (slowly) so its numerics can be tested off-TPU. Auto-enabled when no
 # TPU is present; override with JAX_E_PALLAS_INTERPRET=1/0.
-_PALLAS_INTERPRET = os.environ.get(
-    "JAX_E_PALLAS_INTERPRET",
-    "1" if not any(d.platform == "tpu" for d in jax.devices()) else "0",
-) == "1"
+_PALLAS_INTERPRET = (
+    os.environ.get(
+        "JAX_E_PALLAS_INTERPRET",
+        "1" if not any(d.platform == "tpu" for d in jax.devices()) else "0",
+    )
+    == "1"
+)
 
 # Enable native TPU MXU bfloat16 matmul precision by default
 jax.config.update("jax_default_matmul_precision", "bfloat16")
@@ -67,6 +70,7 @@ class Gemma4EConfig:
     Anything loading a real checkpoint should go through
     ``jax_engine.config_from_hf`` rather than relying on these defaults.
     """
+
     vocab_size: int = 262144
     hidden_size: int = 2560
     intermediate_size: int = 10240
@@ -80,7 +84,7 @@ class Gemma4EConfig:
     rope_theta: float = 10000.0
     global_rope_theta: float = 1000000.0
     partial_rotary_factor: float = 0.25
-    logit_softcapping: float = 30.0        # final logits only
+    logit_softcapping: float = 30.0  # final logits only
     # Gemma 3+ dropped softcapping of ATTENTION scores; the E-series checkpoints
     # declare final_logit_softcapping but no attn_logit_softcapping. Softcapping the
     # scores saturates tanh and destroys the attention distribution.
@@ -107,8 +111,7 @@ class Gemma4EConfig:
             # i.e. full attention at layers 5, 11, 17, ... 41. (E2B's period is 5,
             # full at i % 5 == 4 — pass layer_types explicitly for that model.)
             self.layer_types = [
-                "full_attention" if (i % 6 == 5) else "sliding_attention"
-                for i in range(self.num_hidden_layers)
+                "full_attention" if (i % 6 == 5) else "sliding_attention" for i in range(self.num_hidden_layers)
             ]
 
     @property
@@ -121,15 +124,13 @@ class Gemma4EConfig:
         last_of_type = {}
         for i in range(first):
             last_of_type[self.layer_types[i]] = i
-        return [
-            i if i < first else last_of_type[self.layer_types[i]]
-            for i in range(self.num_hidden_layers)
-        ]
+        return [i if i < first else last_of_type[self.layer_types[i]] for i in range(self.num_hidden_layers)]
 
 
 # ==============================================================================
 # JAX Primitives & QAT Ops (W4A16 & Int8)
 # ==============================================================================
+
 
 def rms_norm_jax(x: jax.Array, weight: Optional[jax.Array] = None, eps: float = 1e-6) -> jax.Array:
     """RMSNorm in JAX matching Gemma 4 spec (computed in float32)."""
@@ -166,14 +167,9 @@ def qat_w4a16_unpack_dequant_jax(
     dequant-matmul before calling W4A16 performance-optimal.
     """
     if packed_int4.ndim != 2 or scale.ndim != 2:
-        raise ValueError(
-            f"W4A16 expects rank-2 packed/scale arrays, got "
-            f"{packed_int4.shape} and {scale.shape}"
-        )
+        raise ValueError(f"W4A16 expects rank-2 packed/scale arrays, got {packed_int4.shape} and {scale.shape}")
     if packed_int4.dtype != jnp.int32:
-        raise TypeError(
-            f"W4A16 packed weights must be int32, got {packed_int4.dtype}"
-        )
+        raise TypeError(f"W4A16 packed weights must be int32, got {packed_int4.dtype}")
 
     out_features, packed_k = packed_int4.shape
     in_features = packed_k * 8
@@ -186,9 +182,7 @@ def qat_w4a16_unpack_dequant_jax(
 
     shifts = (jnp.arange(8, dtype=jnp.int32) * 4)[None, None, :]
     words = packed_int4[:, :, None]
-    q = ((words >> shifts) & jnp.int32(0xF)).reshape(
-        out_features, in_features
-    )
+    q = ((words >> shifts) & jnp.int32(0xF)).reshape(out_features, in_features)
     q = q.astype(jnp.bfloat16) - jnp.bfloat16(8)
     # Apply the group scale by BROADCASTING over the group axis, not by
     # materializing it to full weight width. `jnp.repeat(scale, 32, axis=1)`
@@ -265,12 +259,15 @@ def qat_w4a16_linear_jax(x: jax.Array, packed_int4: jax.Array, scale: jax.Array,
                 # returned wrong values wherever Pallas actually compiled.
                 logger.warning(
                     "W4A16 fused Pallas kernel unavailable (%s); falling back to "
-                    "dequantize-then-matmul. Decode will read BF16 weights.", exc,
+                    "dequantize-then-matmul. Decode will read BF16 weights.",
+                    exc,
                 )
     return qat_w4a16_reference_linear_jax(x, packed_int4, scale, group_size=group_size)
 
 
-def qat_w4a16_reference_linear_jax(x: jax.Array, packed_int4: jax.Array, scale: jax.Array, group_size: int = 32) -> jax.Array:
+def qat_w4a16_reference_linear_jax(
+    x: jax.Array, packed_int4: jax.Array, scale: jax.Array, group_size: int = 32
+) -> jax.Array:
     """Correctness reference: materialize the BF16 weight, then matmul."""
     w_dequant = qat_w4a16_unpack_dequant_jax(packed_int4, scale, group_size=group_size)
     return jnp.matmul(x, w_dequant.T)
@@ -360,6 +357,7 @@ def qat_w4a16_pallas_matmul_jax(
 # Rotary Position Embedding (RoPE)
 # ==============================================================================
 
+
 def rotate_half_jax(x: jax.Array) -> jax.Array:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -381,11 +379,11 @@ def apply_rope_jax(
         # intact.
         d = x.shape[-1]
         half = d // 2
-        n_rot = int(partial_factor * d // 2)          # rotated frequency pairs
+        n_rot = int(partial_factor * d // 2)  # rotated frequency pairs
         keep = (jnp.arange(half) < n_rot).astype(cos.dtype)
         keep_full = jnp.concatenate([keep, keep], axis=-1)
-        cos_p = cos * keep_full + (1.0 - keep_full)   # cos -> 1 where unrotated
-        sin_p = sin * keep_full                       # sin -> 0 where unrotated
+        cos_p = cos * keep_full + (1.0 - keep_full)  # cos -> 1 where unrotated
+        sin_p = sin * keep_full  # sin -> 0 where unrotated
         return (x * cos_p) + (rotate_half_jax(x) * sin_p)
     else:
         return (x * cos) + (rotate_half_jax(x) * sin)
@@ -444,8 +442,9 @@ def make_prefill_causal_mask(valid_mask: jax.Array, window: Optional[int] = None
     return jnp.where(allowed, 0.0, _MASK_MIN).astype(jnp.float32)
 
 
-def make_decode_mask(valid_mask: jax.Array, window: Optional[int] = None,
-                     slot: Optional[jax.Array] = None) -> jax.Array:
+def make_decode_mask(
+    valid_mask: jax.Array, window: Optional[int] = None, slot: Optional[jax.Array] = None
+) -> jax.Array:
     """Additive attention mask for a single cached decode step.
 
     valid_mask: [B, S_total] bool — True for cache slots holding real tokens.
@@ -528,8 +527,7 @@ def _pack_kv(k, v, k_scale, v_scale):
     return (k, v) if k_scale is None else (k, v, k_scale, v_scale)
 
 
-def make_chunk_mask(valid_mask: jax.Array, chunk_len: int, slot,
-                    window: Optional[int] = None) -> jax.Array:
+def make_chunk_mask(valid_mask: jax.Array, chunk_len: int, slot, window: Optional[int] = None) -> jax.Array:
     """Mask for a prefill CHUNK attending over the whole cache.
 
     One-shot prefill attends over the S freshly computed keys, so its mask is
@@ -540,23 +538,23 @@ def make_chunk_mask(valid_mask: jax.Array, chunk_len: int, slot,
     Returns [B, 1, chunk_len, cache_len].
     """
     T = valid_mask.shape[1]
-    t_idx = jnp.arange(T)[None, None, :]                                    # [1, 1, T]
+    t_idx = jnp.arange(T)[None, None, :]  # [1, 1, T]
     s_abs = jnp.asarray(slot, jnp.int32) + jnp.arange(chunk_len)[None, :, None]
-    allowed = valid_mask[:, None, :] & (t_idx <= s_abs)                     # [B, S, T]
+    allowed = valid_mask[:, None, :] & (t_idx <= s_abs)  # [B, S, T]
     if window is not None:
         allowed = allowed & (t_idx > s_abs - int(window))
     return jnp.where(allowed[:, None, :, :], 0.0, _MASK_MIN).astype(jnp.float32)
 
 
 def eager_attention_jax(
-    query: jax.Array,   # [B, H, S, D]
-    key: jax.Array,     # [B, H_kv, S_kv, D]
-    value: jax.Array,   # [B, H_kv, S_kv, D]
+    query: jax.Array,  # [B, H, S, D]
+    key: jax.Array,  # [B, H_kv, S_kv, D]
+    value: jax.Array,  # [B, H_kv, S_kv, D]
     mask: Optional[jax.Array] = None,
     scaling: float = 1.0,
     softcap: float = 30.0,
-    key_scale: Optional[jax.Array] = None,     # [B, H_kv, S_kv, 1]
-    value_scale: Optional[jax.Array] = None,   # [B, H_kv, S_kv, 1]
+    key_scale: Optional[jax.Array] = None,  # [B, H_kv, S_kv, 1]
+    value_scale: Optional[jax.Array] = None,  # [B, H_kv, S_kv, 1]
 ) -> jax.Array:
     """Eager Multi-Head Attention with grouped-query broadcast and logit softcapping.
 
@@ -609,7 +607,7 @@ def eager_attention_jax(
     # no precision relative to scaling a dequantized V.
     probs_f32 = jax.nn.softmax(scores.astype(jnp.float32), axis=-1)
     if value_scale is not None:
-        vs = value_scale[..., 0].astype(jnp.float32)          # [B, Hkv, S_kv]
+        vs = value_scale[..., 0].astype(jnp.float32)  # [B, Hkv, S_kv]
         if n_rep > 1:
             # Regroup into KV groups to broadcast one scale across the n_rep query
             # heads that share a KV head. A reshape, not a repeat — the scale array
@@ -649,9 +647,9 @@ def _ring_store_one(buf: jax.Array, val: jax.Array) -> jax.Array:
     if S <= buf_len:
         return jax.lax.dynamic_update_slice(buf, val.astype(buf.dtype), (0, 0, 0, 0))
 
-    start = S - buf_len                 # first position we keep
-    off = start % buf_len               # its ring slot
-    head = buf_len - off                # positions written at slots off..buf_len-1
+    start = S - buf_len  # first position we keep
+    off = start % buf_len  # its ring slot
+    head = buf_len - off  # positions written at slots off..buf_len-1
     tail = val[:, :, start:, :]
     out = jax.lax.dynamic_update_slice(buf, tail[:, :, :head, :].astype(buf.dtype), (0, 0, off, 0))
     if off:
@@ -760,31 +758,35 @@ class Gemma4EAttentionJAX:
                     # the buffer at `slot`, then attend over the WHOLE buffer so the
                     # history is visible. A prefill chunk is just a decode step that
                     # advances the slot by more than one.
-                    pos = (jax.lax.rem(slot, jnp.int32(buf_len)) if S == 1
-                           else jnp.asarray(slot, jnp.int32))
+                    pos = jax.lax.rem(slot, jnp.int32(buf_len)) if S == 1 else jnp.asarray(slot, jnp.int32)
                     k = jax.lax.dynamic_update_slice(k_buf, k_q.astype(k_buf.dtype), (0, 0, pos, 0))
                     v = jax.lax.dynamic_update_slice(v_buf, v_q.astype(v_buf.dtype), (0, 0, pos, 0))
                     if quantized:
                         key_scale = jax.lax.dynamic_update_slice(
-                            k_scale_buf, k_s.astype(k_scale_buf.dtype), (0, 0, pos, 0))
+                            k_scale_buf, k_s.astype(k_scale_buf.dtype), (0, 0, pos, 0)
+                        )
                         value_scale = jax.lax.dynamic_update_slice(
-                            v_scale_buf, v_s.astype(v_scale_buf.dtype), (0, 0, pos, 0))
+                            v_scale_buf, v_s.astype(v_scale_buf.dtype), (0, 0, pos, 0)
+                        )
                 else:
                     # Prefill attends over the freshly computed bf16 K/V, so the
                     # quantized copy goes to the cache only — no scales are applied
                     # to this pass's attention, and no round-trip error enters it.
                     new_k, new_v = _ring_store(k_buf, v_buf, k_q, v_q)
                     if quantized:
-                        kv_out_override = (new_k, new_v,
-                                           _ring_store_one(k_scale_buf, k_s),
-                                           _ring_store_one(v_scale_buf, v_s))
+                        kv_out_override = (
+                            new_k,
+                            new_v,
+                            _ring_store_one(k_scale_buf, k_s),
+                            _ring_store_one(v_scale_buf, v_s),
+                        )
                     else:
                         kv_out_override = (new_k, new_v)
 
         # Compute Attention
-        attn_out = eager_attention_jax(q, k, v, mask=mask, scaling=self.scaling,
-                                       softcap=self.softcap,
-                                       key_scale=key_scale, value_scale=value_scale)
+        attn_out = eager_attention_jax(
+            q, k, v, mask=mask, scaling=self.scaling, softcap=self.softcap, key_scale=key_scale, value_scale=value_scale
+        )
         attn_out = attn_out.swapaxes(1, 2).reshape(B, S, -1)
 
         # Output projection
@@ -799,8 +801,7 @@ class Gemma4EAttentionJAX:
         # computed (length S during prefill), while the cache STORES whatever the
         # ring buffer holds (possibly shorter, for a windowed layer).
         kv_share = _pack_kv(k, v, key_scale, value_scale)
-        kv_store = (kv_out_override if kv_out_override is not None
-                    else _pack_kv(k, v, key_scale, value_scale))
+        kv_store = kv_out_override if kv_out_override is not None else _pack_kv(k, v, key_scale, value_scale)
         return out, kv_share, kv_store
 
 
@@ -810,7 +811,8 @@ class Gemma4EMLPJAX:
     def __init__(self, config: Gemma4EConfig, is_shared_layer: bool):
         self.is_shared_layer = is_shared_layer
         self.intermediate_size = (
-            config.intermediate_size * 2 if (is_shared_layer and config.use_double_wide_mlp)
+            config.intermediate_size * 2
+            if (is_shared_layer and config.use_double_wide_mlp)
             else config.intermediate_size
         )
 
@@ -842,8 +844,10 @@ class Gemma4EMLPJAX:
 # Full Gemma 4 E-series Model in JAX
 # ==============================================================================
 
-def maybe_quantized_linear(x: jax.Array, params: Dict[str, jax.Array], name: str,
-                           quant_mode: str = "w4a16") -> jax.Array:
+
+def maybe_quantized_linear(
+    x: jax.Array, params: Dict[str, jax.Array], name: str, quant_mode: str = "w4a16"
+) -> jax.Array:
     """Apply a linear that may be stored dense ([in, out]) or W4A16-packed.
 
     QAT checkpoints ship the PLE projections packed; older/plain exports ship them
@@ -892,20 +896,24 @@ class Gemma4EModelJAX:
             # The projection norm is per-layer-slice ([D_ple]) in the shipped
             # checkpoint, not over the flattened [L*D_ple] projection — so reshape
             # to [B, S, L, D_ple] before normalizing.
-            ple_embed = (gather_ple(params, input_ids)
-                         * math.sqrt(D_ple)).reshape(B, S, L, D_ple)
+            ple_embed = (gather_ple(params, input_ids) * math.sqrt(D_ple)).reshape(B, S, L, D_ple)
             ple_proj = maybe_quantized_linear(
-                h * (1.0 / math.sqrt(self.config.hidden_size)), params,
-                "per_layer_model_projection", quant_mode).reshape(B, S, L, D_ple)
-            ple_proj = rms_norm_jax(ple_proj, params.get("per_layer_projection_norm"),
-                                    eps=self.config.rms_norm_eps)
+                h * (1.0 / math.sqrt(self.config.hidden_size)), params, "per_layer_model_projection", quant_mode
+            ).reshape(B, S, L, D_ple)
+            ple_proj = rms_norm_jax(ple_proj, params.get("per_layer_projection_norm"), eps=self.config.rms_norm_eps)
             ple_context = (ple_proj + ple_embed) / math.sqrt(2.0)
         else:
             ple_context = None
 
         # Precompute RoPE cos/sin for sequence length
-        inv_freq_sliding = 1.0 / (self.config.rope_theta ** (jnp.arange(0, self.config.head_dim, 2).astype(jnp.float32) / self.config.head_dim))
-        inv_freq_global = 1.0 / (self.config.global_rope_theta ** (jnp.arange(0, self.config.global_head_dim, 2).astype(jnp.float32) / self.config.global_head_dim))
+        inv_freq_sliding = 1.0 / (
+            self.config.rope_theta
+            ** (jnp.arange(0, self.config.head_dim, 2).astype(jnp.float32) / self.config.head_dim)
+        )
+        inv_freq_global = 1.0 / (
+            self.config.global_rope_theta
+            ** (jnp.arange(0, self.config.global_head_dim, 2).astype(jnp.float32) / self.config.global_head_dim)
+        )
 
         pos_f32 = position_ids.astype(jnp.float32)[:, :, None]
         freqs_sliding = pos_f32 * inv_freq_sliding[None, None, :]
@@ -922,12 +930,13 @@ class Gemma4EModelJAX:
         # Gemma interleaves sliding and full attention; a sliding layer must not
         # see beyond its window. `attention_mask` is the full-attention mask, and
         # `sliding_attention_mask` (if the caller supplied one) is used for the rest.
-        masks = {"full_attention": attention_mask,
-                 "sliding_attention": sliding_attention_mask
-                 if sliding_attention_mask is not None else attention_mask}
+        masks = {
+            "full_attention": attention_mask,
+            "sliding_attention": sliding_attention_mask if sliding_attention_mask is not None else attention_mask,
+        }
 
-        kv_cache_dict = {}    # what later KV-shared layers reuse this pass
-        kv_store_dict = {}    # what gets written back to the persistent cache
+        kv_cache_dict = {}  # what later KV-shared layers reuse this pass
+        kv_store_dict = {}  # what gets written back to the persistent cache
 
         # Layer execution loop
         for i, (attn_layer, mlp_layer) in enumerate(self.layers):
@@ -938,7 +947,9 @@ class Gemma4EModelJAX:
 
             # Determine KV states (shared vs non-shared)
             source_layer_idx = self.share_map[i]
-            kv_shared_states = kv_cache_dict.get(source_layer_idx) if i >= self.config.first_kv_shared_layer_idx else None
+            kv_shared_states = (
+                kv_cache_dict.get(source_layer_idx) if i >= self.config.first_kv_shared_layer_idx else None
+            )
 
             # Attention block
             norm_h = rms_norm_jax(h, layer_params.get("input_layernorm"), eps=self.config.rms_norm_eps)
@@ -957,30 +968,28 @@ class Gemma4EModelJAX:
             # Gemma applies post_attention_layernorm to the attention OUTPUT before
             # the residual add, not as a pre-norm for the MLP. Getting this wrong
             # still runs and still produces tokens — they are just the wrong tokens.
-            h = h + rms_norm_jax(
-                attn_out, layer_params.get("post_attention_layernorm"), eps=self.config.rms_norm_eps)
+            h = h + rms_norm_jax(attn_out, layer_params.get("post_attention_layernorm"), eps=self.config.rms_norm_eps)
 
             if kv_share is not None:
                 kv_cache_dict[i] = kv_share
                 kv_store_dict[i] = kv_store
 
             # Feed-forward, sandwiched: pre-norm in, post-norm on the way out.
-            ffn_in = rms_norm_jax(
-                h, layer_params.get("pre_feedforward_layernorm"), eps=self.config.rms_norm_eps)
+            ffn_in = rms_norm_jax(h, layer_params.get("pre_feedforward_layernorm"), eps=self.config.rms_norm_eps)
             mlp_out = mlp_layer(ffn_in, layer_params["mlp"], quant_mode=quant_mode)
-            h = h + rms_norm_jax(
-                mlp_out, layer_params.get("post_feedforward_layernorm"), eps=self.config.rms_norm_eps)
+            h = h + rms_norm_jax(mlp_out, layer_params.get("post_feedforward_layernorm"), eps=self.config.rms_norm_eps)
 
             # Per-Layer Embedding (PLE) injection
             if ple_context is not None:
                 ple_slice = ple_context[:, :, i, :]  # [B, S, D_ple]
                 gate_out = jax.nn.gelu(
-                    maybe_quantized_linear(h, layer_params, "per_layer_input_gate", quant_mode),
-                    approximate=True)
+                    maybe_quantized_linear(h, layer_params, "per_layer_input_gate", quant_mode), approximate=True
+                )
                 ple_fused = gate_out * ple_slice
-                ple_proj_back = maybe_quantized_linear(
-                    ple_fused, layer_params, "per_layer_projection", quant_mode)
-                ple_normed = rms_norm_jax(ple_proj_back, layer_params.get("post_per_layer_input_norm"), eps=self.config.rms_norm_eps)
+                ple_proj_back = maybe_quantized_linear(ple_fused, layer_params, "per_layer_projection", quant_mode)
+                ple_normed = rms_norm_jax(
+                    ple_proj_back, layer_params.get("post_per_layer_input_norm"), eps=self.config.rms_norm_eps
+                )
                 h = h + ple_normed
 
             # The reference decoder layer ends with `hidden_states *= layer_scalar`
@@ -1001,9 +1010,9 @@ class Gemma4EModelJAX:
         # 262144x1536), the largest single read in the step. An int8-quantized copy
         # (see quantize_lm_head) halves it.
         if "embed_tokens_q8" in params:
-            logits = jnp.matmul(
-                h, params["embed_tokens_q8"].T.astype(h.dtype)
-            ) * params["embed_tokens_q8_scale"].astype(h.dtype)
+            logits = jnp.matmul(h, params["embed_tokens_q8"].T.astype(h.dtype)) * params[
+                "embed_tokens_q8_scale"
+            ].astype(h.dtype)
         else:
             logits = jnp.matmul(h, params["embed_tokens"].T)
         if self.config.logit_softcapping > 0.0:
@@ -1018,6 +1027,7 @@ class Gemma4EModelJAX:
 # ==============================================================================
 # Performance Utilities: Static KV Cache & Fused jax.lax.scan Generation
 # ==============================================================================
+
 
 def init_kv_cache(
     config: Gemma4EConfig,
@@ -1055,8 +1065,7 @@ def init_kv_cache(
             # Ones, not zeros: an unwritten slot is masked out of the softmax, but
             # a zero scale would still feed 0 * inf into the score before masking.
             scale_shape = (batch_size, num_kv, layer_len, 1)
-            entry += (jnp.ones(scale_shape, dtype=_KV_SCALE_DTYPE),
-                      jnp.ones(scale_shape, dtype=_KV_SCALE_DTYPE))
+            entry += (jnp.ones(scale_shape, dtype=_KV_SCALE_DTYPE), jnp.ones(scale_shape, dtype=_KV_SCALE_DTYPE))
         cache[i] = entry
     return cache
 
@@ -1093,9 +1102,7 @@ def generate_n_tokens_scan(
         return (tok, pos + 1), tok
 
     init_state = (first_token, jnp.full((B,), prompt_len, dtype=jnp.int32))
-    (final_tok, _), gen_tokens = jax.lax.scan(
-        scan_step, init_state, None, length=num_steps - 1
-    )
+    (final_tok, _), gen_tokens = jax.lax.scan(scan_step, init_state, None, length=num_steps - 1)
 
     # Combine first token + scanned tokens into [B, num_steps]
     scanned_ids = gen_tokens.squeeze(-1).swapaxes(0, 1)
@@ -1128,6 +1135,7 @@ def dequantize_params_to_dense(params: Dict[str, Any]) -> Dict[str, Any]:
     Returns a new tree with `<name>_packed`/`<name>_scale` replaced by a dense
     `<name>` in [in, out] orientation (what the fp16 path expects).
     """
+
     def convert(node):
         if not isinstance(node, dict):
             return node
@@ -1151,8 +1159,7 @@ def dequantize_params_to_dense(params: Dict[str, Any]) -> Dict[str, Any]:
     return convert(params)
 
 
-def quantize_ple_table(params: Dict[str, jax.Array], bits: int = 8,
-                       group_size: int = 0) -> Dict[str, jax.Array]:
+def quantize_ple_table(params: Dict[str, jax.Array], bits: int = 8, group_size: int = 0) -> Dict[str, jax.Array]:
     """Replace the per-layer-embedding table with an int8 or int4 copy.
 
     `embed_tokens_per_layer` is [vocab, layers*D_ple] — 5.64 GB in BF16 on E4B
@@ -1206,10 +1213,10 @@ def quantize_ple_table(params: Dict[str, jax.Array], bits: int = 8,
     # step against 60 ms resident — the only symptom, since nothing errors.
     src_devices = getattr(tbl, "devices", lambda: set())()
     home = next(iter(src_devices), None)
-    rows_per_chunk = max(1, (1 << 26) // (LD * 4))       # ~256 MB of float32
+    rows_per_chunk = max(1, (1 << 26) // (LD * 4))  # ~256 MB of float32
     q_chunks, s_chunks = [], []
     for start in range(0, V, rows_per_chunk):
-        blk = jax.device_put(tbl[start:start + rows_per_chunk], cpu)
+        blk = jax.device_put(tbl[start : start + rows_per_chunk], cpu)
         blk = blk.astype(jnp.float32).reshape(-1, LD // g, g)
         amax = jnp.max(jnp.abs(blk), axis=-1, keepdims=True)
         scale = jnp.maximum(amax, 1e-8) / qmax
@@ -1244,16 +1251,16 @@ def gather_ple(params: Dict[str, jax.Array], input_ids: jax.Array) -> jax.Array:
         return params["embed_tokens_per_layer"][input_ids]
 
     if q8 is not None:
-        rows = q8[input_ids].astype(jnp.bfloat16)                    # [B, S, LD]
+        rows = q8[input_ids].astype(jnp.bfloat16)  # [B, S, LD]
     else:
         # Gather the packed bytes, then split nibbles — half the HBM traffic of
         # gathering an unpacked table, and the unpack touches only the rows the
         # prompt actually references.
-        packed = q4[input_ids]                                        # [B, S, LD/2]
+        packed = q4[input_ids]  # [B, S, LD/2]
         lo = (packed & 0x0F).astype(jnp.int32) - 8
         hi = (packed >> 4).astype(jnp.int32) - 8
         rows = jnp.stack([lo, hi], axis=-1).reshape(*packed.shape[:-1], -1)
-        rows = rows.astype(jnp.bfloat16)                              # [B, S, LD]
+        rows = rows.astype(jnp.bfloat16)  # [B, S, LD]
 
     scale = params["embed_tokens_per_layer_scale"][input_ids].astype(jnp.bfloat16)
     # scale is [B, S, LD/g, 1]. Derive the group count from its SHAPE rather than
@@ -1292,10 +1299,11 @@ def quantize_lm_head(params: Dict[str, jax.Array], keep_bf16: bool = False) -> D
 # Correct KV-Cached Autoregressive Generation
 # ==============================================================================
 
+
 def prefill_with_kv_cache(
     model: Gemma4EModelJAX,
-    prompt_ids: jax.Array,       # [B, S] (right-padded to a static bucket)
-    prompt_valid: jax.Array,     # [B, S] bool — True for real tokens
+    prompt_ids: jax.Array,  # [B, S] (right-padded to a static bucket)
+    prompt_valid: jax.Array,  # [B, S] bool — True for real tokens
     params: Dict[str, jax.Array],
     max_new_tokens: int,
     quant_mode: str = "w4a16",
@@ -1315,38 +1323,35 @@ def prefill_with_kv_cache(
     if window_kv is None:
         win = model.config.sliding_window
         window_kv = bool(win) and total_len > int(win)
-    caches = init_kv_cache(model.config, batch_size=B, max_seq_len=total_len,
-                           dtype=cache_dtype, window_kv=window_kv)
+    caches = init_kv_cache(model.config, batch_size=B, max_seq_len=total_len, dtype=cache_dtype, window_kv=window_kv)
 
     position_ids = jnp.arange(S, dtype=jnp.int32)[None, :].repeat(B, axis=0)
     # Prefill attends over the freshly computed K/V (S keys), not the padded cache,
     # so the mask is S x S — no padding out to S + max_new_tokens.
     window = model.config.sliding_window
     mask = make_prefill_causal_mask(prompt_valid)
-    sliding_mask = (make_prefill_causal_mask(prompt_valid, window=window)
-                    if window is not None else None)
+    sliding_mask = make_prefill_causal_mask(prompt_valid, window=window) if window is not None else None
 
     logits, caches = model(
-        prompt_ids, params, position_ids,
-        attention_mask=mask, quant_mode=quant_mode,
-        kv_caches=caches, cache_slot=jnp.int32(0),
+        prompt_ids,
+        params,
+        position_ids,
+        attention_mask=mask,
+        quant_mode=quant_mode,
+        kv_caches=caches,
+        cache_slot=jnp.int32(0),
         sliding_attention_mask=sliding_mask,
     )
 
     # Logits at the last REAL token of each row
-    prompt_lens = prompt_valid.sum(axis=1).astype(jnp.int32)          # [B]
-    last_logits = jnp.take_along_axis(
-        logits, (prompt_lens - 1)[:, None, None], axis=1
-    )[:, 0, :]                                                        # [B, V]
+    prompt_lens = prompt_valid.sum(axis=1).astype(jnp.int32)  # [B]
+    last_logits = jnp.take_along_axis(logits, (prompt_lens - 1)[:, None, None], axis=1)[:, 0, :]  # [B, V]
 
-    valid = jnp.concatenate(
-        [prompt_valid, jnp.zeros((B, max_new_tokens), dtype=jnp.bool_)], axis=1
-    )
+    valid = jnp.concatenate([prompt_valid, jnp.zeros((B, max_new_tokens), dtype=jnp.bool_)], axis=1)
     return last_logits, caches, valid
 
 
-def make_chunked_prefill_step(model: Gemma4EModelJAX, chunk_size: int,
-                              quant_mode: str = "w4a16"):
+def make_chunked_prefill_step(model: Gemma4EModelJAX, chunk_size: int, quant_mode: str = "w4a16"):
     """Build a jittable prefill step over ONE chunk of `chunk_size` tokens.
 
     step(params, caches, valid, ids [B, chunk], slot) -> (caches, valid, logits)
@@ -1373,25 +1378,29 @@ def make_chunked_prefill_step(model: Gemma4EModelJAX, chunk_size: int,
         idx = slot_i + jnp.arange(chunk_size)
         valid = valid.at[:, idx].set(True)
         mask = make_chunk_mask(valid, chunk_size, slot_i)
-        sliding_mask = (make_chunk_mask(valid, chunk_size, slot_i, window=window)
-                        if window is not None else None)
+        sliding_mask = make_chunk_mask(valid, chunk_size, slot_i, window=window) if window is not None else None
         position_ids = (slot_i + jnp.arange(chunk_size, dtype=jnp.int32))[None, :]
         position_ids = jnp.broadcast_to(position_ids, ids.shape)
         logits, caches = model(
-            ids, params, position_ids,
-            attention_mask=mask, quant_mode=quant_mode,
-            kv_caches=caches, cache_slot=slot_i,
+            ids,
+            params,
+            position_ids,
+            attention_mask=mask,
+            quant_mode=quant_mode,
+            kv_caches=caches,
+            cache_slot=slot_i,
             sliding_attention_mask=sliding_mask,
             chunked_prefill=True,
         )
         return caches, valid, logits
+
     return step
 
 
 def chunked_prefill_with_kv_cache(
     model: Gemma4EModelJAX,
-    prompt_ids: jax.Array,       # [B, S], S a multiple of chunk_size
-    prompt_valid: jax.Array,     # [B, S] bool
+    prompt_ids: jax.Array,  # [B, S], S a multiple of chunk_size
+    prompt_valid: jax.Array,  # [B, S] bool
     params: Dict[str, jax.Array],
     max_new_tokens: int,
     chunk_size: int = 256,
@@ -1407,19 +1416,16 @@ def chunked_prefill_with_kv_cache(
     if S % chunk_size:
         raise ValueError(f"prompt length {S} must be a multiple of chunk_size {chunk_size}")
     total_len = S + max_new_tokens
-    caches = init_kv_cache(model.config, batch_size=B, max_seq_len=total_len,
-                           dtype=cache_dtype, window_kv=False)
+    caches = init_kv_cache(model.config, batch_size=B, max_seq_len=total_len, dtype=cache_dtype, window_kv=False)
     valid = jnp.zeros((B, total_len), dtype=jnp.bool_)
 
     step = jax.jit(make_chunked_prefill_step(model, chunk_size, quant_mode=quant_mode))
     logits = None
     for start in range(0, S, chunk_size):
-        caches, valid, logits = step(
-            params, caches, valid, prompt_ids[:, start:start + chunk_size], jnp.int32(start))
+        caches, valid, logits = step(params, caches, valid, prompt_ids[:, start : start + chunk_size], jnp.int32(start))
 
     # Padding slots were marked valid chunk-by-chunk; restore the real mask.
-    valid = jnp.concatenate(
-        [prompt_valid, jnp.zeros((B, max_new_tokens), dtype=jnp.bool_)], axis=1)
+    valid = jnp.concatenate([prompt_valid, jnp.zeros((B, max_new_tokens), dtype=jnp.bool_)], axis=1)
 
     # Logits at the last REAL token. Only the final chunk is still in hand, so
     # index within it — every row's last real token lives there when prompts are
@@ -1431,8 +1437,7 @@ def chunked_prefill_with_kv_cache(
     return last_logits, caches, valid
 
 
-def make_cached_decode_step(model: Gemma4EModelJAX, quant_mode: str = "w4a16",
-                            window_kv: bool = False):
+def make_cached_decode_step(model: Gemma4EModelJAX, quant_mode: str = "w4a16", window_kv: bool = False):
     """Build a jittable single-token decode step over a static KV cache.
 
     step(params, caches, valid, tok [B,1], logical_pos [B], slot scalar)
@@ -1452,24 +1457,28 @@ def make_cached_decode_step(model: Gemma4EModelJAX, quant_mode: str = "w4a16",
             # length here instead of constructing (for E4B) an unconditional
             # 512-key mask for, e.g., a 72-key cache.
             ring_len = min(int(valid.shape[1]), int(window))
-            sliding_mask = make_ring_decode_mask(
-                valid, ring_len, jnp.asarray(slot, jnp.int32))
+            sliding_mask = make_ring_decode_mask(valid, ring_len, jnp.asarray(slot, jnp.int32))
         else:
             sliding_mask = make_decode_mask(valid, window=window, slot=slot)
         logits, caches = model(
-            tok, params, logical_pos[:, None],
-            attention_mask=mask, quant_mode=quant_mode,
-            kv_caches=caches, cache_slot=slot,
+            tok,
+            params,
+            logical_pos[:, None],
+            attention_mask=mask,
+            quant_mode=quant_mode,
+            kv_caches=caches,
+            cache_slot=slot,
             sliding_attention_mask=sliding_mask,
         )
         return caches, valid, logits[:, -1, :]
+
     return step
 
 
 def generate_with_kv_cache(
     model: Gemma4EModelJAX,
-    prompt_ids: jax.Array,       # [B, S] right-padded
-    prompt_valid: jax.Array,     # [B, S] bool
+    prompt_ids: jax.Array,  # [B, S] right-padded
+    prompt_valid: jax.Array,  # [B, S] bool
     params: Dict[str, jax.Array],
     max_new_tokens: int,
     quant_mode: str = "w4a16",
@@ -1489,8 +1498,14 @@ def generate_with_kv_cache(
         prng_key = jax.random.PRNGKey(0)
 
     last_logits, caches, valid = prefill_with_kv_cache(
-        model, prompt_ids, prompt_valid, params, max_new_tokens,
-        quant_mode=quant_mode, cache_dtype=cache_dtype, window_kv=window_kv,
+        model,
+        prompt_ids,
+        prompt_valid,
+        params,
+        max_new_tokens,
+        quant_mode=quant_mode,
+        cache_dtype=cache_dtype,
+        window_kv=window_kv,
     )
     step = jax.jit(make_cached_decode_step(model, quant_mode=quant_mode, window_kv=window_kv))
 
@@ -1501,9 +1516,7 @@ def generate_with_kv_cache(
 
     for t in range(max_new_tokens - 1):
         prng_key, sample_key = jax.random.split(prng_key)
-        caches, valid, last_logits = step(
-            params, caches, valid, tok, prompt_lens + t, jnp.int32(S + t)
-        )
+        caches, valid, last_logits = step(params, caches, valid, tok, prompt_lens + t, jnp.int32(S + t))
         tok = onchip_sample_tpu_v6e_jax(last_logits, sample_key, temperature=temperature, top_k=top_k)
         tokens.append(tok)
 
@@ -1514,13 +1527,15 @@ def generate_with_kv_cache(
 # PagedAttention Manager in JAX (Zero Fragmentation)
 # ==============================================================================
 
+
 @dataclasses.dataclass
 class PagedKVCache:
     """Paged Key-Value cache manager in JAX (vLLM-style zero fragmentation)."""
-    k_pages: jax.Array        # [num_blocks, num_kv_heads, block_size, head_dim]
-    v_pages: jax.Array        # [num_blocks, num_kv_heads, block_size, head_dim]
-    block_tables: jax.Array   # [batch_size, max_blocks_per_seq]
-    context_lens: jax.Array   # [batch_size]
+
+    k_pages: jax.Array  # [num_blocks, num_kv_heads, block_size, head_dim]
+    v_pages: jax.Array  # [num_blocks, num_kv_heads, block_size, head_dim]
+    block_tables: jax.Array  # [batch_size, max_blocks_per_seq]
+    context_lens: jax.Array  # [batch_size]
     block_size: int = 16
 
 
@@ -1556,13 +1571,15 @@ def init_paged_kv_cache(
 # TPU v6e Single-Chip Hardware Profile & Vectorized On-Chip Sampling
 # ==============================================================================
 
+
 @dataclasses.dataclass(frozen=True)
 class TPUv6eHardwareProfile:
     """Hardware specifications and MXU alignment rules for Cloud TPU v6e (Trillium)."""
-    hbm_capacity_bytes: int = 33_546_042_880   # 32 GB HBM3
-    hbm_bandwidth_gbps: int = 1638             # 1,638 GB/s HBM3 bandwidth
+
+    hbm_capacity_bytes: int = 33_546_042_880  # 32 GB HBM3
+    hbm_bandwidth_gbps: int = 1638  # 1,638 GB/s HBM3 bandwidth
     vmem_capacity_bytes: int = 16 * 1024 * 1024  # 16 MB VMEM per core
-    mxu_tile_dim: int = 128                    # 128x128 systolic matrix array
+    mxu_tile_dim: int = 128  # 128x128 systolic matrix array
     optimal_k_tile: int = 256
     optimal_n_tile: int = 256
     static_sequence_buckets: Tuple[int, ...] = (64, 128, 256, 512, 1024, 2048, 4096, 8192)
@@ -1576,10 +1593,42 @@ class TPUv6eHardwareProfile:
         return (seq_len + 127) // 128 * 128
 
 
-def pad_to_tpu_v6e_bucket(input_ids: jax.Array, pad_token_id: int = 0) -> Tuple[jax.Array, jax.Array]:
-    """Pads input sequence IDs to nearest 128-aligned TPU v6e static sequence bucket."""
+@dataclasses.dataclass(frozen=True)
+class TPUv5eHardwareProfile:
+    """Hardware specifications and MXU alignment rules for Cloud TPU v5e (v5litepod).
+
+    Only `static_sequence_buckets` is read by the code (via `get_nearest_bucket`);
+    the capacity/bandwidth fields are descriptive. The 128-alignment rule is a
+    property of the 128x128 MXU and is identical on v5e and v6e, so bucket
+    behaviour is unchanged between the two.
+    """
+
+    hbm_capacity_bytes: int = 16_773_021_440  # 16 GB HBM2 (vLLM reports 15.75 GiB usable)
+    hbm_bandwidth_gbps: int = 819  # exactly half of v6e's 1,638 GB/s HBM3
+    vmem_capacity_bytes: int = 16 * 1024 * 1024  # carried over from v6e — UNVERIFIED on v5e
+    mxu_tile_dim: int = 128  # 128x128 systolic array, same as v6e
+    optimal_k_tile: int = 256
+    optimal_n_tile: int = 256
+    static_sequence_buckets: Tuple[int, ...] = (64, 128, 256, 512, 1024, 2048, 4096, 8192)
+
+    @classmethod
+    def get_nearest_bucket(cls, seq_len: int) -> int:
+        """Find the nearest 128-aligned static bucket size to prevent XLA retrace."""
+        for b in cls.static_sequence_buckets:
+            if b >= seq_len:
+                return b
+        return (seq_len + 127) // 128 * 128
+
+
+# The chip this engine is currently targeted at. Swap to TPUv6eHardwareProfile to
+# go back to Trillium; bucket behaviour is identical either way.
+ACTIVE_TPU_PROFILE = TPUv5eHardwareProfile
+
+
+def pad_to_tpu_bucket(input_ids: jax.Array, pad_token_id: int = 0) -> Tuple[jax.Array, jax.Array]:
+    """Pads input sequence IDs to the nearest 128-aligned static sequence bucket."""
     B, S = input_ids.shape
-    bucket_s = TPUv6eHardwareProfile.get_nearest_bucket(S)
+    bucket_s = ACTIVE_TPU_PROFILE.get_nearest_bucket(S)
     if bucket_s == S:
         return input_ids, jnp.ones((B, S), dtype=jnp.bool_)
 
@@ -1589,8 +1638,14 @@ def pad_to_tpu_v6e_bucket(input_ids: jax.Array, pad_token_id: int = 0) -> Tuple[
     return padded_ids, mask
 
 
+# Backward-compatible alias. The bucket rule is 128-alignment from the MXU tile and
+# is identical on v5e and v6e, so existing call sites (including the archived
+# benchmark runs under benchmarks/runs/) keep working unchanged.
+pad_to_tpu_v6e_bucket = pad_to_tpu_bucket
+
+
 def onchip_sample_tpu_v6e_jax(
-    logits: jax.Array,           # [B, V] where V = 262,144 (2,048 x 128 tile-aligned)
+    logits: jax.Array,  # [B, V] where V = 262,144 (2,048 x 128 tile-aligned)
     prng_key: jax.Array,
     temperature: float = 0.7,
     top_k: int = 40,

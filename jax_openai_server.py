@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAI-Compatible FastAPI Server for pure JAX Gemma 4 on TPU v6e-1.
+"""OpenAI-Compatible FastAPI Server for pure JAX Gemma 4 on TPU v5e-1.
 
 Generation runs entirely on the pure-JAX engine in ``jax_engine.py`` (no
 PyTorch, no torch_xla) against a static KV cache, so every streamed token
@@ -56,7 +56,7 @@ METRICS = {
     "last_prefill_ms": 0.0,
 }
 
-app = FastAPI(title="Pure JAX Gemma 4 W4A16 QAT Server on TPU v6e-1")
+app = FastAPI(title="Pure JAX Gemma 4 W4A16 QAT Server on TPU v5e-1")
 
 
 class ChatMessage(BaseModel):
@@ -102,12 +102,9 @@ def fetch_hf_token():
         with urllib.request.urlopen(token_req, timeout=5) as res:
             access_token = json.loads(res.read().decode())["access_token"]
         secret_url = (
-            f"https://secretmanager.googleapis.com/v1/projects/{project}"
-            "/secrets/hf-token/versions/latest:access"
+            f"https://secretmanager.googleapis.com/v1/projects/{project}/secrets/hf-token/versions/latest:access"
         )
-        sec_req = urllib.request.Request(
-            secret_url, headers={"Authorization": f"Bearer {access_token}"}
-        )
+        sec_req = urllib.request.Request(secret_url, headers={"Authorization": f"Bearer {access_token}"})
         with urllib.request.urlopen(sec_req, timeout=5) as res:
             data = json.load(res)["payload"]["data"]
             token = base64.b64decode(data).decode()
@@ -124,6 +121,8 @@ def load_engine(
     quant_mode: str = "w4a16",
     max_model_len: int = 4096,
     local_dir: str | None = None,
+    ple_bits: int = 0,
+    int8_lm_head: bool = False,
 ):
     global ENGINE, TOKENIZER, MODEL_ID, KV_CACHE_DTYPE
     MODEL_ID, KV_CACHE_DTYPE = model_id, kv_dtype
@@ -143,6 +142,8 @@ def load_engine(
         kv_cache_dtype=kv_dtype,
         quant_mode=quant_mode,
         max_model_len=max_model_len,
+        ple_bits=ple_bits,
+        int8_lm_head=int8_lm_head,
     )
     engine.load(local_dir=local_dir)
     engine.bos_token_id = getattr(TOKENIZER, "bos_token_id", None)
@@ -290,16 +291,22 @@ def metrics():
 def list_models():
     return {
         "object": "list",
-        "data": [
-            {"id": MODEL_ID, "object": "model", "created": int(time.time()), "owned_by": "jax-tpu"}
-        ],
+        "data": [{"id": MODEL_ID, "object": "model", "created": int(time.time()), "owned_by": "jax-tpu"}],
     }
 
 
 def _chat_prompt_ids(messages) -> list[int]:
     formatted = [{"role": m.role, "content": m.content} for m in messages]
     if hasattr(TOKENIZER, "apply_chat_template"):
-        return TOKENIZER.apply_chat_template(formatted, tokenize=True, add_generation_prompt=True)
+        out = TOKENIZER.apply_chat_template(formatted, tokenize=True, add_generation_prompt=True)
+        # transformers 4 returns a bare list of ids; transformers 5 returns a
+        # BatchEncoding mapping. Unwrap so callers always get list[int].
+        if hasattr(out, "keys"):
+            out = out["input_ids"]
+        # A batched encoding nests one row per conversation; we only ever send one.
+        if out and isinstance(out[0], (list, tuple)):
+            out = out[0]
+        return list(out)
     text = "\n".join(f"{m.role}: {m.content}" for m in messages)
     return TOKENIZER(text)["input_ids"]
 
@@ -410,13 +417,30 @@ if __name__ == "__main__":
     parser.add_argument("--kv-cache-dtype", default=KV_CACHE_DTYPE)
     parser.add_argument("--quant-mode", default="w4a16", choices=["w4a16", "fp16"])
     parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--local-dir", default=None,
-                        help="Load from a local checkpoint dir instead of the Hub")
+    parser.add_argument("--local-dir", default=None, help="Load from a local checkpoint dir instead of the Hub")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--ple-bits",
+        type=int,
+        default=0,
+        choices=[0, 4, 8],
+        help="Quantize the per-layer-embedding table (E4B: 5.64GB -> 2.82GB at 8, 1.41GB at 4). 0 = off.",
+    )
+    parser.add_argument(
+        "--int8-lm-head",
+        action="store_true",
+        help="Quantize the LM head to int8. NOT numerics-preserving.",
+    )
     args = parser.parse_args()
 
     load_engine(
-        args.model, args.kv_cache_dtype, args.quant_mode, args.max_model_len, args.local_dir
+        args.model,
+        args.kv_cache_dtype,
+        args.quant_mode,
+        args.max_model_len,
+        args.local_dir,
+        args.ple_bits,
+        args.int8_lm_head,
     )
     uvicorn.run(app, host=args.host, port=args.port)
